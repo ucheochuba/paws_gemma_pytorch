@@ -13,8 +13,10 @@
 # limitations under the License.
 """Inference-only Gemma model implementation."""
 
-import json
+from collections import defaultdict
+
 import gc
+import numpy as np
 import os
 import torch
 from torch import nn
@@ -24,6 +26,10 @@ from typing import Any, List, Optional, Sequence, Tuple, Union
 from gemma import config as gemma_config
 from gemma import tokenizer
 
+import json
+
+# A global dictionary to hold scores for all layers
+layer_scores = defaultdict(list)
 
 class Sampler(nn.Module):
 
@@ -223,8 +229,28 @@ class GemmaAttention(nn.Module):
         quant: bool,
         attn_type: gemma_config.AttentionType,
         sliding_window_size: Optional[int] = None,
+        layer_idx: int = None,  # Add the layer index as a parameter
+        use_paws: bool = False,
+        paws_percentile: int = 0,
+        paws_dict: dict = {}, # layer_idx -> paws_percentile -> paws_threshold_value
     ):
         super().__init__()
+
+        self.layer_idx = layer_idx
+        self.use_paws = use_paws
+        self.paws_percentile = paws_percentile
+
+        if use_paws:
+            print(f"Initializing attention layer {layer_idx} with PAWS activated. Cutoff percentile: {paws_percentile}.")
+            
+            if layer_idx not in paws_dict:
+                raise ValueError(f"Layer index {layer_idx} not found in paws_dict!")
+            if paws_percentile not in paws_dict[layer_idx]:
+                raise ValueError(f"PAWS percentile {paws_percentile} not found in paws_dict for layer {layer_idx}!")
+
+            self.paws_threshold_value = paws_dict[layer_idx][paws_percentile]
+        else:
+            self.paws_threshold_value = 0
 
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
@@ -256,6 +282,8 @@ class GemmaAttention(nn.Module):
         self.sliding_window_size = sliding_window_size
         self.attn_logit_softcapping = attn_logit_softcapping
 
+        self.scores_saved = False
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -264,6 +292,8 @@ class GemmaAttention(nn.Module):
         kv_cache: Tuple[torch.Tensor, torch.Tensor],
         mask: torch.Tensor,
     ) -> torch.Tensor:
+        # print("forward method called")
+
         hidden_states_shape = hidden_states.shape
         assert len(hidden_states_shape) == 3
 
@@ -314,11 +344,33 @@ class GemmaAttention(nn.Module):
                 all_ones, -1 * self.sliding_window_size + 1
             ) * torch.tril(all_ones, self.sliding_window_size - 1)
             mask = torch.where(sliding_mask == 1, mask, -2.3819763e38)
+
+
+            sliding_mask_vals = sliding_mask.cpu().numpy()  # Move to CPU if necessary
+            np.save('sliding_mask_vals.npy', sliding_mask_vals)  # Save as .npy
         if self.attn_logit_softcapping is not None:
             scores = scores / self.attn_logit_softcapping
             scores = torch.tanh(scores)
             scores = scores * self.attn_logit_softcapping
         scores = scores + mask
+        
+        # print("size of scores:", scores.size())
+
+        # if not self.scores_saved:
+        #     np_scores = scores.cpu().numpy()  # Move to CPU if necessary
+        #     np.save('scores_tensor.npy', np_scores)  # Save as .npy
+
+        #     self.scores_saved = True
+
+        # Before softmax, save the scores
+        # scores_np = scores.cpu().numpy()  # Move to CPU and convert to NumPy
+        # layer_scores[self.layer_idx].append(scores_np)  # Store scores for the current layer
+
+        # HARVEST SPARSITY HERE
+        if self.use_paws:
+            paws_mask = torch.where(scores < self.paws_threshold_value, torch.full_like(scores, -2.3819763e38), torch.zeros_like(scores))
+            scores = scores + paws_mask
+
         scores = F.softmax(scores.float(), dim=-1).type_as(q)
 
         # [batch_size, n_local_heads, input_len, head_dim]
@@ -336,8 +388,12 @@ class GemmaDecoderLayer(nn.Module):
     def __init__(
         self,
         config: gemma_config.GemmaConfig,
+        layer_idx: int,  # Add the layer index
+        use_paws: bool = False,
+        paws_percentile: int = 0,
     ):
         super().__init__()
+        self.layer_idx = layer_idx  # Store layer index
         self.self_attn = GemmaAttention(
             hidden_size=config.hidden_size,
             num_heads=config.num_attention_heads,
@@ -347,6 +403,7 @@ class GemmaDecoderLayer(nn.Module):
             head_dim=config.head_dim,
             quant=config.quant,
             attn_type=gemma_config.AttentionType.GLOBAL,
+            layer_idx=layer_idx,
         )
         self.mlp = GemmaMLP(
             hidden_size=config.hidden_size,
@@ -375,6 +432,7 @@ class GemmaDecoderLayer(nn.Module):
             kv_write_indices=kv_write_indices,
             kv_cache=kv_cache,
             mask=mask,
+            layer_idx=self.layer_idx,  # Pass layer index
         )
         hidden_states = residual + hidden_states
 
@@ -392,8 +450,13 @@ class Gemma2DecoderLayer(nn.Module):
         self,
         config: gemma_config.GemmaConfig,
         attn_type: gemma_config.AttentionType,
+        layer_idx: int,  # Add the layer index
+        use_paws: bool = False,
+        paws_percentile: int = 0,
+        paws_dict: dict = {},
     ):
         super().__init__()
+        self.layer_idx = layer_idx  # Store layer index
         self.self_attn = GemmaAttention(
             hidden_size=config.hidden_size,
             num_heads=config.num_attention_heads,
@@ -404,6 +467,10 @@ class Gemma2DecoderLayer(nn.Module):
             quant=config.quant,
             attn_type=attn_type,
             sliding_window_size=config.sliding_window_size,
+            layer_idx = layer_idx,  # Store layer index
+            use_paws=use_paws,
+            paws_percentile=paws_percentile,
+            paws_dict=paws_dict,
         )
         self.mlp = GemmaMLP(
             hidden_size=config.hidden_size,
@@ -436,6 +503,7 @@ class Gemma2DecoderLayer(nn.Module):
         # Self Attention
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
+        # print("self_attn layer created")
         hidden_states = self.self_attn(
             hidden_states=hidden_states,
             freqs_cis=freqs_cis,
@@ -460,7 +528,7 @@ class Gemma2DecoderLayer(nn.Module):
 
 class GemmaModel(nn.Module):
 
-    def __init__(self, config: gemma_config.GemmaConfig):
+    def __init__(self, config: gemma_config.GemmaConfig, use_paws: bool = False, paws_percentile: int = 0, paws_dict: dict = {}):
         super().__init__()
         self.config = config
         self.vocab_size = config.vocab_size
@@ -475,7 +543,7 @@ class GemmaModel(nn.Module):
                     if config.attn_types is not None
                     else gemma_config.AttentionType.GLOBAL
                 )
-                self.layers.append(Gemma2DecoderLayer(config, attn_type))
+                self.layers.append(Gemma2DecoderLayer(config, attn_type, i, use_paws=use_paws, paws_percentile=paws_percentile, paws_dict=paws_dict))
             else:
                 raise ValueError(f'Unknown architecture: {config.architecture}')
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -506,6 +574,10 @@ class GemmaForCausalLM(nn.Module):
     def __init__(
         self,
         config: gemma_config.GemmaConfig,
+        use_paws: bool = False,
+        paws_percentile: int = 0,
+        paws_dict: dict = {},
+        
     ):
         super().__init__()
         self.config = config
@@ -517,7 +589,7 @@ class GemmaForCausalLM(nn.Module):
 
         self.tokenizer = tokenizer.Tokenizer(config.tokenizer)
         self.embedder = Embedding(vocab_size, config.hidden_size, config.quant)
-        self.model = GemmaModel(config)
+        self.model = GemmaModel(config, use_paws=use_paws, paws_percentile=paws_percentile, paws_dict=paws_dict)
         self.sampler = Sampler(vocab_size, config)
 
         # Pre-compute rotary embedding table.
@@ -526,6 +598,22 @@ class GemmaForCausalLM(nn.Module):
                                          max_seq_len * 2,
                                          theta=rope_theta)
         self.register_buffer('freqs_cis', freqs_cis)
+
+    def save_scores(self):
+        """
+        Save the scores when the object is destroyed.
+        This method will be called automatically when the object is no longer referenced.
+        """
+        print("Saving layer scores...")
+
+        # Save each layer's scores into a separate .npy file
+        for i in range(26):
+          scores_list = layer_scores[i]
+          save_path = f'scores_by_layer/layer_{i}_scores.pt'
+          torch.save(scores_list, save_path)
+          print(f'saved {save_path}')
+          del layer_scores[i]
+        print("Layer scores saved.")
 
     @torch.no_grad()
     def forward(
@@ -541,6 +629,7 @@ class GemmaForCausalLM(nn.Module):
         top_ks: torch.Tensor,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # print("forward called")
         freqs_cis = self.freqs_cis.index_select(0, input_positions)
         kv_write_indices = input_positions
 
@@ -583,6 +672,7 @@ class GemmaForCausalLM(nn.Module):
         top_k: int = 100,
     ) -> Union[str, Sequence[str]]:
         """Generates responses for given prompts using Gemma model."""
+        # print("generation has begun")
         # If a single prompt is provided, treat it as a batch of 1.
         is_str_prompt = isinstance(prompts, str)
         if is_str_prompt:
