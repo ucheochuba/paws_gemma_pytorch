@@ -363,8 +363,8 @@ class GemmaAttention(nn.Module):
         #     self.scores_saved = True
 
         # Before softmax, save the scores
-        # scores_np = scores.cpu().numpy()  # Move to CPU and convert to NumPy
-        # layer_scores[self.layer_idx].append(scores_np)  # Store scores for the current layer
+        scores_np = scores.cpu().numpy()  # Move to CPU and convert to NumPy
+        layer_scores[self.layer_idx].append(scores_np)  # Store scores for the current layer
 
         # HARVEST SPARSITY HERE
         if self.use_paws:
